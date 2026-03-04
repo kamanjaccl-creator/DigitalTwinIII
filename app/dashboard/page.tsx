@@ -1,7 +1,8 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import Link from "next/link"
+import useSWR from "swr"
 import {
   Shield,
   AlertTriangle,
@@ -44,6 +45,24 @@ import {
   Cell,
 } from "recharts"
 
+// SWR fetcher
+const fetcher = (url: string) => fetch(url).then((res) => res.json())
+
+interface SupabaseEvent {
+  id: number
+  event_id: string
+  type: string
+  severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+  source_ip: string
+  country: string
+  action: "BLOCKED" | "CHALLENGED" | "LOGGED"
+  user_agent: string | null
+  payload: string | null
+  request_path: string | null
+  description: string | null
+  created_at: string
+}
+
 interface ThreatEvent {
   id: string
   type: string
@@ -54,6 +73,8 @@ interface ThreatEvent {
   country: string
   userAgent: string
   payload?: string
+  description?: string
+  requestPath?: string
 }
 
 const severityColors = {
@@ -105,23 +126,21 @@ const geoData = [
   { country: "Other", attacks: 350, percentage: 9 },
 ]
 
-const generateEvents = (): ThreatEvent[] => {
-  const types = ["SQL_INJECTION", "XSS_ATTEMPT", "BOT_TRAFFIC", "BRUTE_FORCE", "PROMPT_INJECTION", "PATH_TRAVERSAL", "CSRF_ATTEMPT"]
-  const severities: ThreatEvent["severity"][] = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-  const actions: ThreatEvent["action"][] = ["BLOCKED", "CHALLENGED", "LOGGED"]
-  const countries = ["US", "CN", "RU", "BR", "IN", "DE", "UK", "FR"]
-  
-  return Array.from({ length: 50 }, (_, i) => ({
-    id: `evt-${1000 + i}`,
-    type: types[Math.floor(Math.random() * types.length)],
-    severity: severities[Math.floor(Math.random() * severities.length)],
-    ip: `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
-    timestamp: new Date(Date.now() - Math.random() * 86400000),
-    action: actions[Math.floor(Math.random() * actions.length)],
-    country: countries[Math.floor(Math.random() * countries.length)],
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    payload: Math.random() > 0.5 ? "SELECT * FROM users WHERE 1=1--" : undefined,
-  })).sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+// Map Supabase events to client ThreatEvent format
+function mapSupabaseEvents(data: SupabaseEvent[]): ThreatEvent[] {
+  return data.map((e) => ({
+    id: e.event_id,
+    type: e.type,
+    severity: e.severity,
+    ip: e.source_ip,
+    timestamp: new Date(e.created_at),
+    action: e.action,
+    country: e.country,
+    userAgent: e.user_agent || "Unknown",
+    payload: e.payload || undefined,
+    description: e.description || undefined,
+    requestPath: e.request_path || undefined,
+  }))
 }
 
 // Attack points on world map (approximate x,y positions on SVG map)
@@ -284,33 +303,44 @@ function AttackMap() {
 
 export default function DashboardPage() {
   const [timeSeriesData, setTimeSeriesData] = useState<ReturnType<typeof generateTimeSeriesData>>([])
-  const [events, setEvents] = useState<ThreatEvent[]>([])
   const [liveTime, setLiveTime] = useState("")
   const [selectedSeverity, setSelectedSeverity] = useState<string>("ALL")
   const [searchQuery, setSearchQuery] = useState("")
   const [selectedEvent, setSelectedEvent] = useState<ThreatEvent | null>(null)
   const [timeRange, setTimeRange] = useState("24h")
-  const [isLoaded, setIsLoaded] = useState(false)
+
+  // Fetch real events from Supabase
+  const eventsUrl = `/api/security-events?limit=100${selectedSeverity !== "ALL" ? `&severity=${selectedSeverity}` : ""}${searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : ""}`
+  const { data: rawEvents, mutate: mutateEvents } = useSWR<SupabaseEvent[]>(eventsUrl, fetcher, {
+    refreshInterval: 15000, // auto-refresh every 15s
+    fallbackData: [],
+  })
+
+  // Fetch real metrics from Supabase
+  const { data: dbMetrics, mutate: mutateMetrics } = useSWR<Record<string, string>>("/api/dashboard-metrics", fetcher, {
+    refreshInterval: 30000,
+    fallbackData: {},
+  })
+
+  const events = mapSupabaseEvents(rawEvents || [])
 
   const metrics = [
-    { label: "Total Requests", value: "289K", change: "+12.5%", icon: Activity, color: "text-primary" },
-    { label: "Threats Detected", value: "1,247", change: "+8.2%", icon: AlertTriangle, color: "text-yellow-500" },
-    { label: "Attacks Blocked", value: "1,189", change: "+15.3%", icon: Ban, color: "text-red-500" },
-    { label: "Block Rate", value: "95.3%", change: "+2.1%", icon: Shield, color: "text-primary" },
+    { label: "Total Requests", value: dbMetrics?.total_requests || "0", change: dbMetrics?.requests_change || "+0%", icon: Activity, color: "text-primary" },
+    { label: "Threats Detected", value: dbMetrics?.threats_detected || "0", change: dbMetrics?.threats_change || "+0%", icon: AlertTriangle, color: "text-yellow-500" },
+    { label: "Attacks Blocked", value: dbMetrics?.attacks_blocked || "0", change: dbMetrics?.blocked_change || "+0%", icon: Ban, color: "text-red-500" },
+    { label: "Block Rate", value: dbMetrics?.block_rate || "0%", change: dbMetrics?.block_rate_change || "+0%", icon: Shield, color: "text-primary" },
   ]
 
   const systemHealth = [
     { label: "WAF Status", value: "Active", icon: Shield, status: "healthy" },
     { label: "API Gateway", value: "Healthy", icon: Zap, status: "healthy" },
-    { label: "Database", value: "Connected", icon: Database, status: "healthy" },
+    { label: "Database", value: "Supabase OK", icon: Database, status: "healthy" },
     { label: "Edge Network", value: "Optimal", icon: Globe, status: "healthy" },
   ]
 
-  // Initialize random data only on the client to avoid hydration mismatch
+  // Initialize chart data on client
   useEffect(() => {
     setTimeSeriesData(generateTimeSeriesData())
-    setEvents(generateEvents())
-    setIsLoaded(true)
   }, [])
 
   useEffect(() => {
@@ -320,30 +350,14 @@ export default function DashboardPage() {
     return () => clearInterval(interval)
   }, [])
 
-  const filteredEvents = events.filter((event) => {
-    const matchesSeverity = selectedSeverity === "ALL" || event.severity === selectedSeverity
-    const matchesSearch = event.type.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      event.ip.includes(searchQuery) ||
-      event.country.toLowerCase().includes(searchQuery.toLowerCase())
-    return matchesSeverity && matchesSearch
-  })
+  // Events are already filtered server-side by SWR URL params
+  const filteredEvents = events
 
-  const handleRefresh = () => {
+  const handleRefresh = useCallback(() => {
     setTimeSeriesData(generateTimeSeriesData())
-    setEvents(generateEvents())
-  }
-
-  // Show loading state until client-side data is ready
-  if (!isLoaded) {
-    return (
-      <div className="min-h-screen bg-background cyber-grid flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <Shield className="w-12 h-12 text-primary animate-pulse mx-auto" />
-          <p className="text-muted-foreground font-mono text-sm">Loading security data...</p>
-        </div>
-      </div>
-    )
-  }
+    mutateEvents()
+    mutateMetrics()
+  }, [mutateEvents, mutateMetrics])
 
   return (
     <div className="min-h-screen bg-background cyber-grid">
@@ -417,13 +431,19 @@ export default function DashboardPage() {
             </div>
           </div>
           <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-            {[
-              { label: "SQL Injection", count: 23, status: "blocked" },
-              { label: "XSS Attempts", count: 14, status: "blocked" },
-              { label: "Brute Force", count: 8, status: "blocked" },
-              { label: "Bot Traffic", count: 45, status: "challenged" },
-              { label: "Prompt Injection", count: 6, status: "blocked" },
-            ].map((item) => (
+            {(() => {
+              const typeCounts: Record<string, number> = {}
+              for (const e of events) {
+                typeCounts[e.type] = (typeCounts[e.type] || 0) + 1
+              }
+              return [
+                { label: "SQL Injection", count: typeCounts["SQL_INJECTION"] || 0, status: "blocked" },
+                { label: "XSS Attempts", count: typeCounts["XSS_ATTEMPT"] || 0, status: "blocked" },
+                { label: "Brute Force", count: typeCounts["BRUTE_FORCE"] || 0, status: "blocked" },
+                { label: "Bot Traffic", count: typeCounts["BOT_TRAFFIC"] || 0, status: "challenged" },
+                { label: "Prompt Injection", count: typeCounts["PROMPT_INJECTION"] || 0, status: "blocked" },
+              ]
+            })().map((item) => (
               <div key={item.label} className="p-3 bg-muted/30 border border-border rounded-lg">
                 <p className="text-xs text-muted-foreground">{item.label}</p>
                 <p className="text-xl font-bold text-foreground mt-1">{item.count}</p>
@@ -877,6 +897,18 @@ export default function DashboardPage() {
                     {selectedEvent.timestamp.toLocaleString()}
                   </p>
                 </div>
+                {selectedEvent.requestPath && (
+                  <div className="col-span-2">
+                    <label className="text-xs text-muted-foreground font-mono">REQUEST PATH</label>
+                    <p className="text-sm text-foreground font-mono mt-1">{selectedEvent.requestPath}</p>
+                  </div>
+                )}
+                {selectedEvent.description && (
+                  <div className="col-span-2">
+                    <label className="text-xs text-muted-foreground font-mono">DESCRIPTION</label>
+                    <p className="text-sm text-foreground font-mono mt-1">{selectedEvent.description}</p>
+                  </div>
+                )}
                 <div className="col-span-2">
                   <label className="text-xs text-muted-foreground font-mono">USER AGENT</label>
                   <p className="text-sm text-foreground font-mono mt-1 break-all">{selectedEvent.userAgent}</p>
